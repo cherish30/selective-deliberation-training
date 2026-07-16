@@ -30,8 +30,14 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 # Gate decisions need only "Deep_think: true/false" (~5 tokens).
 # Cap generation to avoid burning the full action token budget on a trivial binary choice.
 _GATE_MAX_RESPONSE_TOKENS = 64
-# DT memos need to be concise (2-4 sentences). Cap prevents runaway reasoning.
-_DT_MAX_RESPONSE_TOKENS = 256
+# Outer Thought:/Action: turn is a short two-line reply; native thinking is
+# disabled for this call (see extra_template_kwargs below) so 256 is ample.
+_ACTION_MAX_RESPONSE_TOKENS = 256
+# DT phase 1 (Deep think: reasoning) is the one call allowed to run long.
+_DT_REASON_MAX_RESPONSE_TOKENS = 512
+# DT phase 2 (Response: memo) only needs to restate the conclusion in 2-4
+# sentences given the phase-1 reasoning as context.
+_DT_MEMO_MAX_RESPONSE_TOKENS = 256
 
 class TrajectoryCollector:
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
@@ -503,12 +509,20 @@ class TrajectoryCollector:
         """Rollout loop for the selective-thinking modes.
 
         Per env step the loop performs (dt_action mode):
-          1. action generation with deep_think available
+          1. action generation with deep_think available (native thinking off,
+             256-token cap)
           2. if response is `Action: deep_think`:
                 - mark the row is_dt_step=True, active_masks=True (its tokens
                   drive GRPO loss for the gate decision), DO NOT step env
-                - run a deep_think generation with INNER_DEEP_THINK_SYSTEM_PROMPT
-                  (its tokens do NOT enter the trajectory)
+                - run a deep_think generation in TWO separate calls (native
+                  thinking off for both): phase 1 with
+                  INNER_DEEP_THINK_SYSTEM_PROMPT_REASON (512-token cap) produces
+                  the "Deep think:" reasoning; phase 2 with
+                  INNER_DEEP_THINK_SYSTEM_PROMPT_MEMO (128-token cap), given
+                  phase 1's reasoning as context, produces the "Response:" memo.
+                  Splitting into two calls guarantees the memo is never
+                  truncated mid-reasoning the way a single combined call could be.
+                  (their tokens do NOT enter the trajectory)
                 - state.record_deep_think(memo)
                 - re-prompt with deep_think disabled and run another action
                   generation; that response drives env.step
@@ -516,14 +530,15 @@ class TrajectoryCollector:
         For selective_gate mode:
           0. gate generation with TWO_PHASE_GATE_SYSTEM_PROMPT (tokens DO NOT
              enter trajectory; we want gate behaviour to stay close to SFT)
-          1. if gate=true: deep_think generation -> memo
+          1. if gate=true: two-phase deep-think generation (see above) -> memo
           2. action generation (system prompt depends on whether DT just ran)
              -> response drives env.step
         """
         from agent_system.environments.env_package.alfworld.selective_thinking import (
             DT_ACTION_SYSTEM_PROMPT_DT_AVAIL,
             DT_ACTION_SYSTEM_PROMPT_DT_USED,
-            INNER_DEEP_THINK_SYSTEM_PROMPT,
+            INNER_DEEP_THINK_SYSTEM_PROMPT_REASON,
+            INNER_DEEP_THINK_SYSTEM_PROMPT_MEMO,
             TWO_PHASE_GATE_SYSTEM_PROMPT,
             TWO_PHASE_ACTION_SYSTEM_PROMPT_POST_DT,
             TWO_PHASE_ACTION_SYSTEM_PROMPT_NO_DT,
@@ -531,6 +546,7 @@ class TrajectoryCollector:
             extract_action_text,
             extract_gate_decision,
             extract_memo_text,
+            extract_reason_text,
             is_deep_think_call,
             build_gate_user,
         )
@@ -621,25 +637,47 @@ class TrajectoryCollector:
                     if not active_masks[i]:
                         gate_decisions[i] = False
 
-            # ---------- (selective_gate only) phase-1.5 DT generation ----------
+            # ---------- (selective_gate only) phase-1.5 DT generation (two calls) ----------
             if mode == "selective_gate":
                 dt_indices = [i for i in range(batch_size) if active_masks[i] and gate_decisions[i]]
                 if dt_indices:
                     # Only generate for the envs that actually need DT (not all batch_size).
-                    dt_systems_active = [INNER_DEEP_THINK_SYSTEM_PROMPT] * len(dt_indices)
+                    dt_reason_systems_active = [INNER_DEEP_THINK_SYSTEM_PROMPT_REASON] * len(dt_indices)
                     dt_users_active = [obs["text"][i] for i in dt_indices]
-                    dt_gen_batch = copy.copy(gen_batch)
-                    dt_gen_batch.meta_info = {**gen_batch.meta_info, 'response_length': _DT_MAX_RESPONSE_TOKENS}
-                    dt_outs, dt_token_counts = self._generate_with_obs(
-                        obs_systems=dt_systems_active,
+                    dt_reason_gen_batch = copy.copy(gen_batch)
+                    dt_reason_gen_batch.meta_info = {
+                        **gen_batch.meta_info, 'response_length': _DT_REASON_MAX_RESPONSE_TOKENS,
+                    }
+                    reason_outs, reason_token_counts = self._generate_with_obs(
+                        obs_systems=dt_reason_systems_active,
                         obs_texts=dt_users_active,
-                        gen_batch=dt_gen_batch,
+                        gen_batch=dt_reason_gen_batch,
                         actor_rollout_wg=actor_rollout_wg,
                         active_indices=dt_indices,
+                        extra_template_kwargs={'enable_thinking': False},
                     )
+
+                    dt_memo_systems_active = [INNER_DEEP_THINK_SYSTEM_PROMPT_MEMO] * len(dt_indices)
+                    dt_memo_users_active = [
+                        f"{dt_users_active[j]}\n\nYour deliberation:\n{extract_reason_text(reason_outs[j])}"
+                        for j in range(len(dt_indices))
+                    ]
+                    dt_memo_gen_batch = copy.copy(gen_batch)
+                    dt_memo_gen_batch.meta_info = {
+                        **gen_batch.meta_info, 'response_length': _DT_MEMO_MAX_RESPONSE_TOKENS,
+                    }
+                    memo_outs, memo_token_counts = self._generate_with_obs(
+                        obs_systems=dt_memo_systems_active,
+                        obs_texts=dt_memo_users_active,
+                        gen_batch=dt_memo_gen_batch,
+                        actor_rollout_wg=actor_rollout_wg,
+                        active_indices=dt_indices,
+                        extra_template_kwargs={'enable_thinking': False},
+                    )
+
                     for j, i in enumerate(dt_indices):
-                        total_output_tokens[i] += dt_token_counts[j]
-                        memo = extract_memo_text(dt_outs[j])
+                        total_output_tokens[i] += reason_token_counts[j] + memo_token_counts[j]
+                        memo = extract_memo_text(memo_outs[j])
                         states[i].record_deep_think(memo, env_step + 1)
                         tool_callings[i] += 1.0
 
@@ -662,7 +700,17 @@ class TrajectoryCollector:
                     )
             obs_with_system = {**obs, "system": outer_systems}
 
-            batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs_with_system)
+            # Outer Thought:/Action: turn: native thinking off, 256-token cap
+            # (see _ACTION_MAX_RESPONSE_TOKENS comment near the top of this file).
+            action_gen_batch = copy.copy(gen_batch)
+            action_gen_batch.meta_info = {
+                **gen_batch.meta_info, 'response_length': _ACTION_MAX_RESPONSE_TOKENS,
+            }
+            batch = self.preprocess_batch(
+                gen_batch=action_gen_batch,
+                obs=obs_with_system,
+                extra_template_kwargs={'enable_thinking': False},
+            )
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
@@ -676,7 +724,7 @@ class TrajectoryCollector:
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
             )
-            batch_input.meta_info = gen_batch.meta_info
+            batch_input.meta_info = action_gen_batch.meta_info
             batch_input_padded, pad_size = pad_dataproto_to_divisor(batch_input, actor_rollout_wg.world_size)
             batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
             batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
@@ -711,20 +759,42 @@ class TrajectoryCollector:
                         is_dt_step_arr[i] = True
                         dt_indices.append(i)
                 if dt_indices:
-                    dt_systems_active = [INNER_DEEP_THINK_SYSTEM_PROMPT] * len(dt_indices)
+                    dt_reason_systems_active = [INNER_DEEP_THINK_SYSTEM_PROMPT_REASON] * len(dt_indices)
                     dt_users_active = [obs["text"][i] for i in dt_indices]
-                    dt_gen_batch = copy.copy(gen_batch)
-                    dt_gen_batch.meta_info = {**gen_batch.meta_info, 'response_length': _DT_MAX_RESPONSE_TOKENS}
-                    dt_outs, dt_token_counts = self._generate_with_obs(
-                        obs_systems=dt_systems_active,
+                    dt_reason_gen_batch = copy.copy(gen_batch)
+                    dt_reason_gen_batch.meta_info = {
+                        **gen_batch.meta_info, 'response_length': _DT_REASON_MAX_RESPONSE_TOKENS,
+                    }
+                    reason_outs, reason_token_counts = self._generate_with_obs(
+                        obs_systems=dt_reason_systems_active,
                         obs_texts=dt_users_active,
-                        gen_batch=dt_gen_batch,
+                        gen_batch=dt_reason_gen_batch,
                         actor_rollout_wg=actor_rollout_wg,
                         active_indices=dt_indices,
+                        extra_template_kwargs={'enable_thinking': False},
                     )
+
+                    dt_memo_systems_active = [INNER_DEEP_THINK_SYSTEM_PROMPT_MEMO] * len(dt_indices)
+                    dt_memo_users_active = [
+                        f"{dt_users_active[j]}\n\nYour deliberation:\n{extract_reason_text(reason_outs[j])}"
+                        for j in range(len(dt_indices))
+                    ]
+                    dt_memo_gen_batch = copy.copy(gen_batch)
+                    dt_memo_gen_batch.meta_info = {
+                        **gen_batch.meta_info, 'response_length': _DT_MEMO_MAX_RESPONSE_TOKENS,
+                    }
+                    memo_outs, memo_token_counts = self._generate_with_obs(
+                        obs_systems=dt_memo_systems_active,
+                        obs_texts=dt_memo_users_active,
+                        gen_batch=dt_memo_gen_batch,
+                        actor_rollout_wg=actor_rollout_wg,
+                        active_indices=dt_indices,
+                        extra_template_kwargs={'enable_thinking': False},
+                    )
+
                     for j, i in enumerate(dt_indices):
-                        total_output_tokens[i] += dt_token_counts[j]
-                        memo = extract_memo_text(dt_outs[j])
+                        total_output_tokens[i] += reason_token_counts[j] + memo_token_counts[j]
+                        memo = extract_memo_text(memo_outs[j])
                         states[i].record_deep_think(memo, env_step + 1)
                         tool_callings[i] += 1.0
                     # For dt_action steps we replace the projection input with

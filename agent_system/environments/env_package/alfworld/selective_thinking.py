@@ -62,11 +62,34 @@ ACTION_GUIDANCE_BASE = (
 
 ACTION_GUIDANCE_DT_AVAIL = (
     "Now it's your turn to take an action.\n"
-    "Use deep_think as the main place for task-level thinking and planning.\n"
-    "Use Thought only for a brief current-state judgment about the immediate next move.\n"
-    "If the task needs search, planning, uncertainty resolution, recovery, or you cannot bind "
-    "the plan to one admissible action yet, output `Action: deep_think` instead.\n"
-    "Otherwise output one admissible environment action."
+    "Deep thinking is a valuable exploratory process: it lets you explore alternatives, "
+    "revisit assumptions, and reconsider your current strategy at points where that "
+    "reasoning can genuinely improve your plan. It is neither something to avoid nor "
+    "something to overuse -- judge each step on its own merits. Use Thought only for a "
+    "brief current-state judgment about the immediate next move; use deep_think as the "
+    "main place for task-level thinking and planning.\n"
+    "# WhenToUseDeepThink\n"
+    "Deep thinking is well spent when:\n"
+    "- the next grounded move is unclear,\n"
+    "- recent steps have repeated or failed without progress,\n"
+    "- the current observation contradicts the latest note,\n"
+    "- a short local judgment is not enough to choose one admissible action.\n"
+    "A direct environment action is the better choice when one concrete admissible action "
+    "clearly advances the current task and no open question remains to reason through.\n"
+    "If you find yourself needing to explore multiple possibilities, weigh alternatives, or "
+    "reconsider your plan, stop and output `Action: deep_think` -- do not write that reasoning "
+    "out in Thought. Thought is only for stating the local judgment you already reached, not for "
+    "reaching it.\n"
+    "This is a firm rule, not a suggestion: whenever you notice yourself actually thinking or "
+    "exploring -- weighing options, uncertain which is right, reconsidering the plan -- you "
+    "must call `Action: deep_think` right then. Do not silently work through it and then act "
+    "as if no deliberation happened.\n"
+    "# Examples\n"
+    "Thought: The last two steps both failed; I need a better plan.\n"
+    "Action: deep_think\n"
+    "\n"
+    "Thought: The note says check closed containers; cabinet 2 is available.\n"
+    "Action: open cabinet 2"
 )
 
 ACTION_GUIDANCE_DT_USED = (
@@ -78,19 +101,23 @@ ACTION_GUIDANCE_DT_USED = (
     "deep_think is not available on this step."
 )
 
-INNER_DEEP_THINK_SYSTEM_PROMPT = (
+INNER_DEEP_THINK_SYSTEM_PROMPT_REASON = (
     "You are an internal deep-thinking tool for an ALFWorld agent.\n"
     "You receive the same ALFWorld task context, recent trajectory context, current "
     "observation, and current admissible actions.\n"
-    "Reply with exactly two labeled sections in this order:\n\n"
-    "Deep think: [your internal reasoning and deliberation]\n"
-    "Response: [your concise action memo]\n\n"
-    "Use \"Deep think:\" for internal reasoning and deliberation: analyze the current state, "
-    "what has been tried, what is blocking progress, and what the best forward plan is. "
-    "Reason toward a conclusion rather than listing possibilities.\n"
-    "Use \"Response:\" for one compact memo (2-4 direct sentences) that will be written "
-    "back into later context as the outer agent's guide. Put the key conclusion and the "
-    "concrete forward plan here.\n"
+    "Reply with \"Deep think: \" followed by your internal reasoning and deliberation: "
+    "analyze the current state, what has been tried, what is blocking progress, and what "
+    "the best forward plan is. Reason toward a conclusion rather than listing possibilities.\n"
+    "Do not output an environment action. Do not write a final memo yet -- a separate step "
+    "will ask you for that afterwards."
+)
+
+INNER_DEEP_THINK_SYSTEM_PROMPT_MEMO = (
+    "You are the same internal deep-thinking tool for an ALFWorld agent, immediately after "
+    "finishing the deliberation shown above as context.\n"
+    "Reply with \"Response: \" followed by one compact memo (2-4 direct sentences) that will "
+    "be written back into later context as the outer agent's guide. Put the key conclusion "
+    "and the concrete forward plan here -- do not repeat the full reasoning.\n"
     "Do not output an environment action."
 )
 
@@ -235,23 +262,45 @@ _RESPONSE_BLOCK_RE = re.compile(
 _RESPONSE_TAG_RE = re.compile(
     r"<response>\s*(.+?)\s*</response>", flags=re.IGNORECASE | re.DOTALL
 )
+_REASON_BLOCK_RE = re.compile(
+    r"(?is)\bdeep\s*think\s*[:=]\s*(.+?)(?:\n\s*response\s*[:=]|\Z)",
+)
 
 
 def extract_memo_text(raw_output: str) -> str:
-    """Extract the `Response: ...` memo from a deep-think output.
+    """Extract the `Response: ...` memo from the phase-2 (memo) DT output.
 
-    Falls back to the whole text if no marker is present so a malformed DT
-    call still produces *some* guidance text rather than an empty memo.
+    Strips any leaked native <think>...</think> block first (same as
+    extract_gate_decision/extract_action_text) before looking for the marker.
+    Falls back to the whole (stripped) text if no marker is present so a
+    malformed DT call still produces *some* guidance text rather than an
+    empty memo.
     """
     if not raw_output:
         return ""
-    text = raw_output
+    text = _strip_think_block(raw_output)
     block_match = _RESPONSE_BLOCK_RE.search(text)
     if block_match:
         return _normalize_whitespace(block_match.group(1))
     tag_match = _RESPONSE_TAG_RE.search(text)
     if tag_match:
         return _normalize_whitespace(tag_match.group(1))
+    return _normalize_whitespace(text)
+
+
+def extract_reason_text(raw_output: str) -> str:
+    """Extract the `Deep think: ...` reasoning from the phase-1 (reason) DT
+    output, for use as context when prompting phase 2 (memo) generation.
+
+    Strips any leaked native <think>...</think> block first. Falls back to
+    the whole (stripped) text if the `Deep think:` marker is missing.
+    """
+    if not raw_output:
+        return ""
+    text = _strip_think_block(raw_output)
+    match = _REASON_BLOCK_RE.search(text)
+    if match:
+        return _normalize_whitespace(match.group(1))
     return _normalize_whitespace(text)
 
 
@@ -474,7 +523,8 @@ __all__ = [
     "DT_ACTION_SYSTEM_PROMPT_DT_USED",
     "ACTION_GUIDANCE_DT_AVAIL",
     "ACTION_GUIDANCE_DT_USED",
-    "INNER_DEEP_THINK_SYSTEM_PROMPT",
+    "INNER_DEEP_THINK_SYSTEM_PROMPT_REASON",
+    "INNER_DEEP_THINK_SYSTEM_PROMPT_MEMO",
     "TWO_PHASE_GATE_SYSTEM_PROMPT",
     "TWO_PHASE_ACTION_SYSTEM_PROMPT_POST_DT",
     "TWO_PHASE_ACTION_SYSTEM_PROMPT_NO_DT",
@@ -485,6 +535,7 @@ __all__ = [
     "extract_gate_decision",
     "extract_action_text",
     "extract_memo_text",
+    "extract_reason_text",
     "is_deep_think_call",
     "summarize_memo",
     "render_memo_block",

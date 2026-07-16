@@ -120,6 +120,30 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     valid_returns = torch.masked_select(returns, response_mask)
     unique_traj_uid, unique_idx = np.unique(batch.non_tensor_batch['traj_uid'], return_index=True)
 
+    # Per-episode reward INCLUDING token-efficiency / DT-quality penalties.
+    # IMPORTANT: episode_rewards (the raw task outcome) is broadcast by the rollout
+    # collector to EVERY turn/row belonging to a trajectory (see
+    # agent_system/multi_turn_rollout/rollout_loop.py, which copies episode_rewards[bs]
+    # onto each turn's dict), and agent_system/reward_manager/episode.py writes that same
+    # value into token_level_scores at every row's own last token position. Only the
+    # trajectory's LAST active row then gets a penalty subtracted (apply_token_efficiency_
+    # penalty / apply_dt_quality_reward operate on per_traj_last_active_idx). So summing
+    # sequence_reward across all rows of a trajectory would multiply the raw reward by
+    # its turn count; we instead take the LAST active row per traj_uid, mirroring the
+    # exact indexing apply_dt_quality_reward uses to apply the penalty.
+    _traj_uid_arr = batch.non_tensor_batch['traj_uid']
+    _active_masks = batch.non_tensor_batch.get('active_masks')
+    if _active_masks is None:
+        _active_masks = np.ones(len(_traj_uid_arr), dtype=bool)
+    else:
+        _active_masks = np.asarray(_active_masks).astype(bool)
+    _seq_reward_np = sequence_reward.detach().cpu().numpy()
+    _last_active_idx_per_traj: dict = {}
+    for _i, (_uid, _active) in enumerate(zip(_traj_uid_arr, _active_masks)):
+        if _active:
+            _last_active_idx_per_traj[_uid] = _i
+    episode_reward_values = np.array([_seq_reward_np[_idx] for _idx in _last_active_idx_per_traj.values()])
+
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
@@ -165,13 +189,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "prompt_length/max": torch.max(prompt_length).detach().item(),
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
-        # episode
-        "episode/reward/mean": 
-            batch.non_tensor_batch["episode_rewards"][unique_idx].mean().item(),
-        "episode/reward/max": 
-            batch.non_tensor_batch["episode_rewards"][unique_idx].max().item(),
-        "episode/reward/min": 
-            batch.non_tensor_batch["episode_rewards"][unique_idx].min().item(),
+        # episode reward: per-trajectory sum of token_level_rewards (includes
+        # token-efficiency + DT-quality penalties), NOT the raw win/loss signal --
+        # see episode_reward_values computed above. Previously this read the raw,
+        # unpenalized "episode_rewards" field, which made it numerically identical
+        # to episode/success_rate and hid the effect of the efficiency/DT penalties.
+        "episode/reward/mean": episode_reward_values.mean().item(),
+        "episode/reward/max": episode_reward_values.max().item(),
+        "episode/reward/min": episode_reward_values.min().item(),
         "episode/length/mean": 
             batch.non_tensor_batch["episode_lengths"][unique_idx].mean().item(),
         "episode/length/max":

@@ -757,30 +757,16 @@ class ActorRolloutRefWorker(Worker):
         self.checkpoint_manager.save_checkpoint(local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep)
         dist.barrier()
 
-        if self._is_lora and isinstance(self.actor_module, PeftModel):
-            lora_save_path = os.path.join(local_path, "lora_adapter")
-            peft_config = {}
-            if dist.get_rank() == 0:
-                os.makedirs(lora_save_path, exist_ok=True)
-                peft_config = asdict(self.actor_module.peft_config.get('default', {}))
-                peft_config['task_type'] = peft_config['task_type'].value
-                peft_config['peft_type'] = peft_config['peft_type'].value
-                peft_config['target_modules'] = list(peft_config['target_modules'])
-            try:
-                if isinstance(self.actor_module_fsdp, FSDP):
-                    self.actor_module_fsdp = self.actor_module_fsdp.cuda()
-                    lora_params = layered_summon_lora_params(self.actor_module_fsdp)
-                    if dist.get_rank() == 0:
-                        save_file(lora_params, os.path.join(lora_save_path, "adapter_model.safetensors"))
-                        with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding='utf-8') as f:
-                            json.dump(peft_config, f, ensure_ascii=False, indent=4)
-            except Exception as e:
-                if dist.get_rank() == 0:
-                    print(f"[rank-{self.rank}]: Save LoRA Adapter Error ({e})")
-
-            dist.barrier()
-            if dist.get_rank() == 0:
-                print(f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_save_path}")
+        # NOTE: a second, redundant LoRA-adapter save used to run here via
+        # layered_summon_lora_params(), which calls FSDP.summon_full_params() per
+        # transformer layer and manually resets submodule._is_root afterwards. That
+        # sequence left flat_param.data and flat_param._local_shard pointing at
+        # different storages for at least one handle, which then tripped the
+        # data_ptr-equality assertion inside offload_fsdp_model_to_cpu() right below
+        # and crashed the whole training run at checkpoint time. The LoRA adapter is
+        # already saved by self.checkpoint_manager.save_checkpoint() above (the
+        # "lora_only" content path), so this block was pure duplication and is
+        # removed rather than reconciling the two save paths.
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

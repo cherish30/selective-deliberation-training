@@ -63,6 +63,10 @@ actor_rollout_ref:
       sr_threshold_hi: 0.70           # SR at/above this -> coef = base_coef
       window_size: 256                # episodes used for the running SR estimate
       token_budget: 4096.0            # normalization denominator for total output tokens
+    dt_quality_reward:                # deep-think call-count penalty relative to adaptive reference
+      excess_coef_won: 0.01           # penalty coef applied to (Ndt - reference - 1)_+ on won episodes
+      adaptive_threshold:
+        init_val: 5.0                 # initial reference Ndt before any winning episodes are observed
     use_kl_loss: False # True for GRPO
     use_torch_compile: True # False to disable torch compile
     kl_loss_coef: 0.001 # for grpo

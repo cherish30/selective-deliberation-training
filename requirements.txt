@@ -4,11 +4,12 @@ vllm==0.8.5
 transformers==4.51.1
 peft==0.19.1
 accelerate==1.13.0
+# flash-attn is a hard requirement in this setup: Qwen3-8B is loaded with
+# attn_implementation="flash_attention_2" (see fsdp_workers.py), not optional.
 flash-attn==2.7.4.post1
 
 # RL training
 ray[default]==2.55.1
-liger-kernel==0.8.0
 tensordict==0.6.2
 torchdata==0.11.0
 
@@ -39,3 +40,8 @@ qwen-vl-utils==0.0.14
 # Environments
 alfworld==0.4.2
 smolagents==1.25.0
+
+# Optional (not installed in the current verl-alfworld env, not needed by any
+# of our launch scripts): only required if actor_rollout_ref.model.use_liger
+# is set to true (default false in ppo_trainer.yaml; see fsdp_workers.py).
+# liger-kernel==0.8.0

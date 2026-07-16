@@ -61,7 +61,6 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
-from gigpo import core_gigpo
 
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
@@ -243,7 +242,7 @@ class TokenEfficiencyPenaltyController:
         base_coef: float = 0.05,
         sr_threshold_lo: float = 0.60,
         sr_threshold_hi: float = 0.60,
-        window_size: int = 256,
+        window_size: int = 128,
         token_budget: float = 4096.0,
     ) -> None:
         self.base_coef = float(base_coef)
@@ -280,17 +279,22 @@ class AdaptiveDTThresholdController:
     reference(t) = mean(dt_calls | won, last window_size winning episodes)
 
     The buffer tracks only SUCCESSFUL episodes so the baseline stays clean.
-    Falls back to init_val (5) until at least one winning episode is observed.
+    Holds at init_val until the window has accumulated window_size winning
+    episodes -- it does not blend in the running mean early (which would let a
+    handful of episodes right after cold start swamp the configured initial
+    reference). Only once the buffer is full does it switch to the true
+    moving average of the last window_size winning episodes.
     """
 
     def __init__(
         self,
         init_val: float = 5.0,
-        window_size: int = 256,
+        window_size: int = 128,
     ) -> None:
         self.init_val = float(init_val)
+        self.window_size = int(max(1, window_size))
         from collections import deque
-        self._won_dt_buffer = deque(maxlen=int(max(1, window_size)))
+        self._won_dt_buffer = deque(maxlen=self.window_size)
 
     def update(self, won_array: np.ndarray, dt_calls_array: np.ndarray) -> None:
         for won, dt in zip(
@@ -301,7 +305,7 @@ class AdaptiveDTThresholdController:
                 self._won_dt_buffer.append(float(dt))
 
     def current_mean_won_dt(self) -> float:
-        if not self._won_dt_buffer:
+        if len(self._won_dt_buffer) < self.window_size:
             return self.init_val
         return float(sum(self._won_dt_buffer) / len(self._won_dt_buffer))
 
@@ -423,13 +427,15 @@ def apply_dt_quality_reward(
     No explicit positive reward for DT usage — SR signal drives DT discovery
     through group-level GRPO advantage.
 
-    Penalises only WON episodes where dt_calls exceeds the adaptive reference
-    (mean dt_calls of winning episodes) by more than 1:
+    Penalises WON episodes symmetrically whenever dt_calls deviates from the
+    adaptive reference (mean dt_calls of winning episodes) by more than 1 in
+    either direction -- both overthinking and underthinking are penalised:
 
-        penalty = excess_coef_won × max(0, dt_calls - dt_reference - 1)
+        penalty = excess_coef_won × max(0, |dt_calls - dt_reference| - 1)
 
-    The −1 buffer creates a symmetric protection zone: both DT=ref−1 and
-    DT=ref+1 are neutral, so GRPO compares them on SR alone.
+    The width-1 buffer around the reference is neutral (DT=ref-1, ref, ref+1
+    all incur no penalty), but deviating further in either direction is
+    penalised the same way, mirroring the over- and under-thinking cases.
 
     Lost episodes are not penalised — task reward = 0 already signals failure;
     penalising DT on failing paths suppresses exploration when the model needs
@@ -476,11 +482,11 @@ def apply_dt_quality_reward(
         if won <= 0.0:
             continue  # only efficiency pressure on won episodes
 
-        excess = dt_calls - dt_reference - 1.0  # width-1 buffer: DT ≤ ref+1 is neutral
-        if excess <= 0.0:
+        deviation = abs(dt_calls - dt_reference) - 1.0  # width-1 buffer on both sides of ref
+        if deviation <= 0.0:
             continue
 
-        penalty = excess_coef_won * excess
+        penalty = excess_coef_won * deviation
 
         prompt_length = data[last_idx].batch['prompts'].shape[-1]
         valid_response_length = int(data[last_idx].batch['attention_mask'][prompt_length:].sum())
@@ -623,6 +629,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.GiGPO:
+        from gigpo import core_gigpo
+
         advantages, returns = core_gigpo.compute_gigpo_outcome_advantage(
             token_level_rewards=data.batch['token_level_rewards'], # for episode group reward computing
             step_rewards=data.batch['step_rewards'], # for step group reward computing
@@ -734,14 +742,14 @@ class RayPPOTrainer:
                 base_coef=float(token_pen_cfg.get('base_coef', 0.05)) if token_pen_cfg else 0.05,
                 sr_threshold_lo=float(token_pen_cfg.get('sr_threshold_lo', 0.60)) if token_pen_cfg else 0.60,
                 sr_threshold_hi=float(token_pen_cfg.get('sr_threshold_hi', 0.60)) if token_pen_cfg else 0.60,
-                window_size=int(token_pen_cfg.get('window_size', 256)) if token_pen_cfg else 256,
+                window_size=int(token_pen_cfg.get('window_size', 128)) if token_pen_cfg else 128,
                 token_budget=float(token_pen_cfg.get('token_budget', 4096.0)) if token_pen_cfg else 4096.0,
             )
             dt_quality_cfg = config.actor_rollout_ref.actor.get('dt_quality_reward', None)
             _dt_thr_cfg = dt_quality_cfg.get('adaptive_threshold', None) if dt_quality_cfg else None
             self.dt_threshold_ctrl = AdaptiveDTThresholdController(
                 init_val=float(_dt_thr_cfg.get('init_val', 5.0)) if _dt_thr_cfg else 5.0,
-                window_size=int(token_pen_cfg.get('window_size', 256)) if token_pen_cfg else 256,
+                window_size=int(token_pen_cfg.get('window_size', 128)) if token_pen_cfg else 128,
             )
         else:
             self.dt_threshold_ctrl = None
@@ -1433,6 +1441,8 @@ class RayPPOTrainer:
                     batch = gen_batch_output
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
+                        from gigpo import core_gigpo
+
                         step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
                             batch=batch,
                             gamma=self.config.algorithm.gamma

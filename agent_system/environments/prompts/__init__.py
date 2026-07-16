@@ -13,8 +13,28 @@
 # limitations under the License.
 
 from .alfworld import *
-from .webshop import *
-from .sokoban import *
-from .gym_cards import *
-from .appworld import *
-from .search import *
+
+# Only the ALFWorld prompt module ships in this release (the paper trains and
+# evaluates the RL policy on ALFWorld only). The other verl-agent (GiGPO)
+# environment prompt modules are optional and not included; skip them if absent
+# rather than failing import for users who only need ALFWorld.
+try:
+    from .webshop import *
+except ModuleNotFoundError:
+    pass
+try:
+    from .sokoban import *
+except ModuleNotFoundError:
+    pass
+try:
+    from .gym_cards import *
+except ModuleNotFoundError:
+    pass
+try:
+    from .appworld import *
+except ModuleNotFoundError:
+    pass
+try:
+    from .search import *
+except ModuleNotFoundError:
+    pass

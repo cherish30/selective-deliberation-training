@@ -49,9 +49,17 @@ def extract_lora_state_dict(model):
         if 'lora_' in name:
             state_dict[name] = param.data.cpu() if param.is_cuda else param.data
     
-    # Also check for LoRA in state dict directly if available
+    # Also check for LoRA in state dict directly if available.
+    # This model.state_dict() call is a collective FSDP operation and MUST be
+    # wrapped in the correct state_dict_type context, or under real multi-GPU
+    # FSDP sharding it desyncs flat_param.data from flat_param._local_shard and
+    # crashes later in offload_fsdp_model_to_cpu's consistency assertion.
+    # (Single-GPU/world_size=1 runs use FSDP's NO_SHARD path and never hit this,
+    # which is why this bug can silently pass single-GPU smoke tests.)
     try:
-        full_state_dict = model.state_dict()
+        state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+        with get_fsdp_state_ctx(model, StateDictType.FULL_STATE_DICT, state_dict_config, None):
+            full_state_dict = model.state_dict()
         for name, param in full_state_dict.items():
             if 'lora_' in name:
                 state_dict[name] = param.cpu() if param.is_cuda else param
@@ -61,13 +69,34 @@ def extract_lora_state_dict(model):
     return state_dict
 
 
+def _json_sanitize(value):
+    """Recursively convert values not natively JSON-serializable (e.g. PEFT's
+    target_modules, which is a set at runtime, or nested dataclass config
+    objects like LoraRuntimeConfig) into JSON-safe equivalents."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (set, frozenset)):
+        return sorted(value) if all(isinstance(v, str) for v in value) else list(value)
+    if isinstance(value, dict):
+        return {k: _json_sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_sanitize(v) for v in value]
+    if hasattr(value, "value"):
+        # enum.Enum members (e.g. peft.TaskType, peft.PeftType)
+        return value.value
+    if hasattr(value, "__dict__"):
+        # Arbitrary nested config objects (e.g. peft's LoraRuntimeConfig)
+        return _json_sanitize(vars(value))
+    return value
+
+
 def save_lora_config(save_directory, lora_config):
     """
     Save LoRA configuration to adapter_config.json
     """
     os.makedirs(save_directory, exist_ok=True)
     config_file = os.path.join(save_directory, "adapter_config.json")
-    
+
     # Convert LoraConfig to dict if it's an object
     if hasattr(lora_config, '__dict__'):
         config_dict = lora_config.__dict__
@@ -80,7 +109,8 @@ def save_lora_config(save_directory, lora_config):
             "task_type": "CAUSAL_LM",
             "inference_mode": False
         }
-    
+
+    config_dict = _json_sanitize(config_dict)
     with open(config_file, 'w') as f:
         json.dump(config_dict, f, indent=2)
 
@@ -303,15 +333,25 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         
         if save_lora_only:
             # Only save LoRA adapter (much smaller)
+            # extract_lora_state_dict() calls model.state_dict() on the FSDP-wrapped
+            # module, which is a collective operation -- every rank must call it,
+            # otherwise rank 0 blocks forever waiting for the other ranks' shards
+            # while they sit idle at the barrier below (observed as a 30-minute
+            # torch.distributed.barrier() timeout with world_size > 1).
+            try:
+                lora_state_dict = extract_lora_state_dict(self.model)
+            except Exception as e:
+                lora_state_dict = None
+                if self.rank == 0:
+                    print(f"[rank-{self.rank}]: Error extracting LoRA adapter: {e}")
             if self.rank == 0:
                 print(f"[rank-{self.rank}]: Saving LoRA adapter only to {os.path.abspath(local_path)}")
                 try:
-                    lora_state_dict = extract_lora_state_dict(self.model)
                     if lora_state_dict:
                         lora_path = os.path.join(local_path, "adapter_model.bin")
                         torch.save(lora_state_dict, lora_path)
                         print(f"[rank-{self.rank}]: Saved LoRA adapter with {len(lora_state_dict)} parameters")
-                        
+
                         # Save adapter config
                         lora_config = get_lora_config_from_model(self.model)
                         save_lora_config(local_path, lora_config)
@@ -322,6 +362,28 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     print(f"[rank-{self.rank}]: Error saving LoRA adapter: {e}")
                     # Fall back to normal checkpoint saving if LoRA fails
                     save_lora_only = False
+
+                # The lora_only path used to `return` here before ever reaching the
+                # tokenizer/model-config save below (which only runs in the full
+                # checkpoint branch) -- so every lora_only checkpoint was missing the
+                # HF tokenizer/processor and base model config.json entirely, making
+                # the saved adapter directory unusable on its own for eval/resume
+                # without manually copying those files from the base model path.
+                # Save them here too, same as the full-checkpoint branch below.
+                try:
+                    if fsdp_version(self.model) == 1:
+                        unwrap_model = self.model._fsdp_wrapped_module
+                    else:
+                        unwrap_model = self.model
+                    model_config = unwrap_model.config
+                    if unwrap_model.can_generate() and hasattr(model_config, "name_or_path") and model_config.name_or_path:
+                        generation_config = GenerationConfig.from_pretrained(model_config.name_or_path)
+                        generation_config.save_pretrained(local_path)
+                    model_config.save_pretrained(local_path)
+                    self.processing_class.save_pretrained(local_path)
+                    print(f"[rank-{self.rank}]: Saved tokenizer/processor and base model config alongside LoRA adapter")
+                except Exception as e:
+                    print(f"[rank-{self.rank}]: Error saving tokenizer/model config alongside LoRA adapter: {e}")
             torch.distributed.barrier()
             self.previous_saved_paths.append(local_path)
             return
